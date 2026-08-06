@@ -50,4 +50,3 @@ void mme_s13_send_ecr(enb_ue_t *enb_ue, mme_ue_t *mme_ue);
 #endif
 
 #endif /* MME_FD_PATH_H */
-
