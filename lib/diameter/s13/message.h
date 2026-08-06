@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define OGS_DIAM_S13_APPLICATION_ID 16777272
+#define OGS_DIAM_S13_APPLICATION_ID 16777252
 
 #define OGS_DIAM_S13_EQUIPMENT_WHITELIST                (0)
 #define OGS_DIAM_S13_EQUIPMENT_BLACKLIST                (1)
