@@ -80,7 +80,6 @@ typedef struct served_gummei_s {
 typedef enum {
     MME_EIR_ALLOW = 0,      /* default on calloc: fail-open */
     MME_EIR_REJECT,
-    MME_EIR_LOG,
 } mme_eir_action_e;
 
 typedef enum {
@@ -97,7 +96,7 @@ typedef struct mme_eir_s {
     bool        allow_greylist;
     bool        allow_blacklist;
     uint32_t    max_age;         /* s, 0 = no TTL */
-    int         on_unavailable;  /* ALLOW | REJECT */
+    mme_eir_action_e on_unavailable;  /* ALLOW | REJECT */
     ogs_hash_t  *cache;          /* key = imsi_bcd */
     ogs_list_t  cache_list;      /* LRU */
 } mme_eir_t;
@@ -547,8 +546,8 @@ struct mme_ue_s {
     ogs_nas_mobile_identity_imeisv_t nas_mobile_identity_imeisv;
 
     /* EIR (S13) per-UE state */
-    bool        imeisv_requested;   /*  Identity Request already sent */
-    int         s13_procedure;      /* ATTACH | TAU, */
+    bool        imeisv_requested;   /* Identity Request already sent */
+    mme_s13_procedure_e s13_procedure;  /* ATTACH | TAU */
 
     uint8_t         msisdn[OGS_MAX_MSISDN_LEN];
     int             msisdn_len;

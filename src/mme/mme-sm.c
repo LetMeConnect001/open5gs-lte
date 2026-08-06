@@ -33,6 +33,7 @@
 #include "mme-s11-handler.h"
 #include "mme-fd-path.h"
 #include "mme-s6a-handler.h"
+#include "mme-s13-handler.h"
 #include "mme-path.h"
 #include "mme-dns.h"
 
@@ -76,6 +77,8 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
     mme_sess_t *sess = NULL;
 
     ogs_diam_s6a_message_t *s6a_message = NULL;
+    ogs_diam_s13_message_t *s13_message = NULL;
+    mme_s13_result_e s13_result = MME_S13_RESULT_ALLOWED;
     uint8_t emm_cause = 0;
 
     ogs_gtp_node_t *gnode = NULL;
@@ -689,6 +692,86 @@ cleanup:
         ogs_subscription_data_free(&s6a_message->idr_message.subscription_data);
         ogs_subscription_data_free(&s6a_message->ula_message.subscription_data);
         ogs_free(s6a_message);
+        break;
+
+    case MME_EVENT_S13_MESSAGE:
+        s13_message = e->s13_message;
+        ogs_assert(s13_message);
+
+        /*
+         * Same race condition as for S6A_MESSAGE above: the UE context may
+         * have been removed while the EIR was being queried.
+         */
+        mme_ue = mme_ue_find_by_id(e->mme_ue_id);
+        if (!mme_ue) {
+            ogs_error("UE(mme-ue) context has already been removed");
+            ogs_free(s13_message);
+            break;
+        }
+
+        enb_ue = enb_ue_find_by_id(e->enb_ue_id);
+        /*
+         * The 'enb_ue' context is not checked
+         * because the status is checked in the sending routine.
+         */
+
+        switch (s13_message->cmd_code) {
+        case OGS_DIAM_S13_CMD_CODE_ME_IDENTITY_CHECK:
+            ogs_debug("OGS_DIAM_S13_CMD_CODE_ME_IDENTITY_CHECK");
+            s13_result = mme_s13_handle_eca(mme_ue, s13_message);
+
+            /*
+             * The EIR gave no verdict: it is up to the operator whether an
+             * unreachable EIR blocks the UE or lets it through.
+             */
+            if (s13_result == MME_S13_RESULT_UNAVAILABLE) {
+                if (mme_self()->eir.on_unavailable == MME_EIR_REJECT) {
+                    ogs_warn("[%s] EIR unavailable, rejecting the UE",
+                            mme_ue->imsi_bcd);
+                    s13_result = MME_S13_RESULT_DENIED;
+                } else {
+                    ogs_warn("[%s] EIR unavailable, allowing the UE",
+                            mme_ue->imsi_bcd);
+                    s13_result = MME_S13_RESULT_ALLOWED;
+                }
+            }
+
+            if (s13_result == MME_S13_RESULT_ALLOWED) {
+                /* Equipment accepted: resume with the Update Location */
+                mme_s6a_send_ulr(enb_ue, mme_ue, 0);
+                break;
+            }
+
+            if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST) {
+                ogs_info("[%s] Attach reject [OGS_NAS_EMM_CAUSE:%d]",
+                        mme_ue->imsi_bcd, OGS_NAS_EMM_CAUSE_ILLEGAL_ME);
+                r = nas_eps_send_attach_reject(
+                        enb_ue, mme_ue, OGS_NAS_EMM_CAUSE_ILLEGAL_ME,
+                        OGS_NAS_ESM_CAUSE_PROTOCOL_ERROR_UNSPECIFIED);
+                ogs_expect(r == OGS_OK);
+                ogs_assert(r != OGS_ERROR);
+            } else if (mme_ue->nas_eps.type == MME_EPS_TYPE_TAU_REQUEST) {
+                ogs_info("[%s] TAU reject [OGS_NAS_EMM_CAUSE:%d]",
+                        mme_ue->imsi_bcd, OGS_NAS_EMM_CAUSE_ILLEGAL_ME);
+                r = nas_eps_send_tau_reject(
+                        enb_ue, mme_ue, OGS_NAS_EMM_CAUSE_ILLEGAL_ME);
+                ogs_expect(r == OGS_OK);
+                ogs_assert(r != OGS_ERROR);
+            } else
+                ogs_error("Invalid Type[%d]", mme_ue->nas_eps.type);
+
+            r = s1ap_send_ue_context_release_command(enb_ue,
+                    S1AP_Cause_PR_nas, S1AP_CauseNas_normal_release,
+                    S1AP_UE_CTX_REL_UE_CONTEXT_REMOVE, 0);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+            break;
+        default:
+            ogs_error("Invalid Type[%d]", s13_message->cmd_code);
+            break;
+        }
+
+        ogs_free(s13_message);
         break;
 
     case MME_EVENT_S11_MESSAGE:

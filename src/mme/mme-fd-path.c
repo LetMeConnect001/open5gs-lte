@@ -2705,17 +2705,23 @@ void mme_s13_send_ecr(enb_ue_t *enb_ue, mme_ue_t *mme_ue)
 
     ogs_debug("[MME] ME-Identity-Check-Request");
 
-    if (!mme_ue->imeisv_len) {
-        ogs_error("[%s] No IMEISV available, skipping EIR check",
+    /*
+     * The Terminal-Information AVP is built out of the 16-digit IMEISV:
+     * 14 digits of IMEI (TAC + SNR, without the check digit) followed by
+     * the 2-digit Software Version Number. Anything shorter cannot be
+     * split, so the check is skipped rather than sending a malformed ECR.
+     */
+    if (strlen(mme_ue->imeisv_bcd) < OGS_MAX_IMEISV_BCD_LEN) {
+        ogs_error("[%s] No valid IMEISV available, skipping EIR check",
                 mme_ue->imsi_bcd);
         mme_s6a_send_ulr(enb_ue, mme_ue, 0);
         return;
     }
 
-    if (!mme_self()->diam_eir_realm) {
+    if (!mme_self()->eir.realm) {
         ogs_warn("[%s] No EIR configured, skipping ME identity check",
                 mme_ue->imsi_bcd);
-        mme_s6a_send_ulr(enb_ue, mme_ue, create_action);
+        mme_s6a_send_ulr(enb_ue, mme_ue, 0);
         return;
     }
 
@@ -2756,11 +2762,11 @@ void mme_s13_send_ecr(enb_ue_t *enb_ue, mme_ue_t *mme_ue)
     ogs_assert(ret == 0);
 
      /* Set the Destination-Host AVP (optional per TS 29.272 §7.2.x) */
-    if (mme_self()->diam_eir_host) {
+    if (mme_self()->eir.host) {
         ret = fd_msg_avp_new(ogs_diam_destination_host, 0, &avp);
         ogs_assert(ret == 0);
-        val.os.data = (uint8_t *)mme_self()->diam_eir_host;
-        val.os.len  = strlen(mme_self()->diam_eir_host);
+        val.os.data = (uint8_t *)mme_self()->eir.host;
+        val.os.len  = strlen(mme_self()->eir.host);
         ret = fd_msg_avp_setvalue(avp, &val);
         ogs_assert(ret == 0);
         ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
@@ -2770,8 +2776,8 @@ void mme_s13_send_ecr(enb_ue_t *enb_ue, mme_ue_t *mme_ue)
     /* Set the Destination-Realm AVP (mandatory) */
     ret = fd_msg_avp_new(ogs_diam_destination_realm, 0, &avp);
     ogs_assert(ret == 0);
-    val.os.data = (uint8_t *)mme_self()->diam_eir_realm;
-    val.os.len  = strlen(mme_self()->diam_eir_realm);
+    val.os.data = (uint8_t *)mme_self()->eir.realm;
+    val.os.len  = strlen(mme_self()->eir.realm);
     ret = fd_msg_avp_setvalue(avp, &val);
     ogs_assert(ret == 0);
     ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
@@ -2836,6 +2842,238 @@ void mme_s13_send_ecr(enb_ue_t *enb_ue, mme_ue_t *mme_ue)
 
 
 
+/* MME received ME Identity Check Answer from EIR */
+static void mme_s13_eca_cb(void *data, struct msg **msg)
+{
+    int ret, rv, new;
+    struct sess_state *sess_data;
+    struct timespec ts;
+    struct session *session;
+    struct avp *avp, *avpch;
+    struct avp_hdr *hdr;
+    unsigned long dur;
+    int error;
+    mme_event_t *e;
+    mme_ue_t *mme_ue;
+    enb_ue_t *enb_ue;
+    ogs_diam_s13_message_t *s13_message;
+
+    sess_data = NULL;
+    error = 0;
+    e = NULL;
+    mme_ue = NULL;
+    enb_ue = NULL;
+    s13_message = NULL;
+
+    ogs_debug("[MME] ME-Identity-Check-Answer");
+
+    ret = clock_gettime(CLOCK_REALTIME, &ts);
+    ogs_assert(ret == 0);
+
+    /*
+     * freeDiameter invokes this callback with *msg set to NULL when the
+     * peer never answered. There is no verdict to read in that case, so
+     * the message is reported with a transport error and the operator
+     * policy (eir.on_unavailable) decides in the state machine.
+     */
+    if (!msg || !*msg) {
+        ogs_error("No ME-Identity-Check-Answer from the EIR");
+        error++;
+        goto cleanup;
+    }
+
+    /* Search the session, retrieve its data */
+    ret = fd_msg_sess_get(fd_g_config->cnf_dict, *msg, &session, &new);
+    if (ret != 0) {
+        ogs_error("fd_msg_sess_get() failed");
+        goto cleanup;
+    }
+    if (new != 0) {
+        ogs_error("fd_msg_sess_get() failed - unexpected new session");
+        goto cleanup;
+    }
+
+    ret = fd_sess_state_retrieve(mme_s13_reg, session, &sess_data);
+    if (ret != 0) {
+        ogs_error("fd_sess_state_retrieve() failed");
+        goto cleanup;
+    }
+    if (!sess_data) {
+        ogs_error("fd_sess_state_retrieve() failed - no session data");
+        goto cleanup;
+    }
+    if ((void *)sess_data != data) {
+        ogs_error("fd_sess_state_retrieve() failed - data mismatch");
+        goto cleanup;
+    }
+
+    mme_ue = mme_ue_find_by_id(sess_data->mme_ue_id);
+    if (!mme_ue) {
+        ogs_error("MME-UE Context has already been removed [%d]",
+                sess_data->mme_ue_id);
+        goto cleanup;
+    }
+    enb_ue = enb_ue_find_by_id(sess_data->enb_ue_id);
+    if (!enb_ue) {
+        ogs_error("[%s] ENB-S1 Context has already been removed [%d]",
+                mme_ue->imsi_bcd, sess_data->enb_ue_id);
+        goto cleanup;
+    }
+
+    s13_message = ogs_calloc(1, sizeof(ogs_diam_s13_message_t));
+    if (!s13_message) {
+        ogs_error("Failed to allocate s13_message");
+        error++;
+        goto cleanup;
+    }
+
+    s13_message->cmd_code = OGS_DIAM_S13_CMD_CODE_ME_IDENTITY_CHECK;
+
+    /* AVP: 'Result-Code'(268)
+     * The Result-Code AVP indicates whether a particular request was completed
+     * successfully or whether an error occurred.
+     * Reference: RFC 6733
+     */
+    ret = fd_msg_search_avp(*msg, ogs_diam_result_code, &avp);
+    ogs_assert(ret == 0);
+    if (avp) {
+        ret = fd_msg_avp_hdr(avp, &hdr);
+        ogs_assert(ret == 0);
+        s13_message->result_code = hdr->avp_value->i32;
+        s13_message->err = &s13_message->result_code;
+        ogs_debug("    Result Code: %d", hdr->avp_value->i32);
+    } else {
+        ret = fd_msg_search_avp(*msg, ogs_diam_experimental_result, &avp);
+        ogs_assert(ret == 0);
+        if (avp) {
+            ret = fd_avp_search_avp(avp,
+                    ogs_diam_experimental_result_code, &avpch);
+            ogs_assert(ret == 0);
+            if (avpch) {
+                ret = fd_msg_avp_hdr(avpch, &hdr);
+                ogs_assert(ret == 0);
+                s13_message->result_code = hdr->avp_value->i32;
+                s13_message->exp_err = &s13_message->result_code;
+                ogs_debug("    Experimental Result Code: %d",
+                        s13_message->result_code);
+            }
+        } else {
+            ogs_error("no Result-Code");
+            error++;
+            goto cleanup;
+        }
+    }
+
+    /* AVP: 'Equipment-Status'(1445)
+     * The Equipment-Status AVP holds the verdict of the EIR on the
+     * equipment identity carried in the request.
+     * Reference: 3GPP TS 29.272-f70
+     *
+     * The AVP is only present on a successful answer; its absence
+     * alongside an error Result-Code is expected and not an error here.
+     */
+    ret = fd_msg_search_avp(*msg, ogs_diam_s13_equipment_status, &avp);
+    ogs_assert(ret == 0);
+    if (avp) {
+        ret = fd_msg_avp_hdr(avp, &hdr);
+        ogs_assert(ret == 0);
+        s13_message->eca_message.equipment_status_code = hdr->avp_value->i32;
+        ogs_debug("    Equipment-Status: %d", hdr->avp_value->i32);
+    } else if (s13_message->result_code == ER_DIAMETER_SUCCESS) {
+        ogs_error("no_Equipment-Status");
+        error++;
+        goto cleanup;
+    }
+
+cleanup:
+    /*
+     * The event is pushed even on error: the state machine must always
+     * be given the chance to resume the attach, either by applying the
+     * operator policy or by rejecting the UE. Dropping it silently would
+     * leave the UE waiting until it gives up.
+     */
+    if (mme_ue && enb_ue) {
+        if (!s13_message) {
+            s13_message = ogs_calloc(1, sizeof(ogs_diam_s13_message_t));
+        }
+        if (s13_message) {
+            s13_message->cmd_code = OGS_DIAM_S13_CMD_CODE_ME_IDENTITY_CHECK;
+            if (error && s13_message->result_code == ER_DIAMETER_SUCCESS) {
+                s13_message->result_code = ER_DIAMETER_UNABLE_TO_COMPLY;
+                s13_message->err = &s13_message->result_code;
+            }
+
+            e = mme_event_new(MME_EVENT_S13_MESSAGE);
+            if (!e) {
+                ogs_error("Failed to create MME event");
+                ogs_free(s13_message);
+                s13_message = NULL;
+            } else {
+                e->mme_ue_id = mme_ue->id;
+                e->enb_ue_id = enb_ue->id;
+                e->s13_message = s13_message;
+                rv = ogs_queue_push(ogs_app()->queue, e);
+                if (rv != OGS_OK) {
+                    ogs_error("ogs_queue_push() failed:%d", (int)rv);
+                    mme_event_free(e);
+                    ogs_free(s13_message);
+                    s13_message = NULL;
+                    error++;
+                } else {
+                    ogs_pollset_notify(ogs_app()->pollset);
+                    /* Transfer ownership of s13_message to event */
+                    s13_message = NULL;
+                }
+            }
+        }
+    }
+
+    if (s13_message)
+        ogs_free(s13_message);
+
+    /* Update statistics */
+    ogs_assert(pthread_mutex_lock(&ogs_diam_stats_self()->stats_lock) == 0);
+    if (sess_data) {
+        dur = ((ts.tv_sec - sess_data->ts.tv_sec) * 1000000) +
+            ((ts.tv_nsec - sess_data->ts.tv_nsec) / 1000);
+        if (ogs_diam_stats_self()->stats.nb_recv) {
+            /* Ponderate in the avg */
+            ogs_diam_stats_self()->stats.avg =
+                (ogs_diam_stats_self()->stats.avg *
+                ogs_diam_stats_self()->stats.nb_recv + dur) /
+                (ogs_diam_stats_self()->stats.nb_recv + 1);
+            /* Min, max */
+            if (dur < ogs_diam_stats_self()->stats.shortest)
+                ogs_diam_stats_self()->stats.shortest = dur;
+            if (dur > ogs_diam_stats_self()->stats.longest)
+                ogs_diam_stats_self()->stats.longest = dur;
+        } else {
+            ogs_diam_stats_self()->stats.shortest = dur;
+            ogs_diam_stats_self()->stats.longest = dur;
+            ogs_diam_stats_self()->stats.avg = dur;
+        }
+    }
+
+    if (error)
+        ogs_diam_stats_self()->stats.nb_errs++;
+    else
+        ogs_diam_stats_self()->stats.nb_recv++;
+
+    ogs_assert(pthread_mutex_unlock(&ogs_diam_stats_self()->stats_lock) == 0);
+
+    /* Free the message */
+    if (msg && *msg) {
+        ret = fd_msg_free(*msg);
+        ogs_assert(ret == 0);
+        *msg = NULL;
+    }
+
+    /* Clean up session data */
+    if (sess_data) {
+        state_cleanup(sess_data, NULL, NULL);
+    }
+}
+
 int mme_fd_init(void)
 {
     int ret;
@@ -2849,8 +3087,14 @@ int mme_fd_init(void)
     ret = ogs_diam_s6a_init();
     ogs_assert(ret == OGS_OK);
 
+    ret = ogs_diam_s13_init();
+    ogs_assert(ret == OGS_OK);
+
     /* Create handler for sessions */
     ret = fd_sess_handler_create(&mme_s6a_reg, &state_cleanup, NULL, NULL);
+    ogs_assert(ret == 0);
+
+    ret = fd_sess_handler_create(&mme_s13_reg, &state_cleanup, NULL, NULL);
     ogs_assert(ret == 0);
 
     /* Specific handler for Cancel-Location-Request */
@@ -2870,6 +3114,9 @@ int mme_fd_init(void)
     ret = fd_disp_app_support(ogs_diam_s6a_application, ogs_diam_vendor, 1, 0);
     ogs_assert(ret == 0);
 
+    ret = fd_disp_app_support(ogs_diam_s13_application, ogs_diam_vendor, 1, 0);
+    ogs_assert(ret == 0);
+
     ret = ogs_diam_start();
     ogs_assert(ret == 0);
 
@@ -2881,6 +3128,9 @@ void mme_fd_final(void)
     int ret;
 
     ret = fd_sess_handler_destroy(&mme_s6a_reg, NULL);
+    ogs_assert(ret == OGS_OK);
+
+    ret = fd_sess_handler_destroy(&mme_s13_reg, NULL);
     ogs_assert(ret == OGS_OK);
 
     if (hdl_s6a_clr)
