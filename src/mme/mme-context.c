@@ -49,6 +49,7 @@ static OGS_POOL(mme_hssmap_pool, mme_hssmap_t);
 static OGS_POOL(mme_enb_pool, mme_enb_t);
 static OGS_POOL(mme_ue_pool, mme_ue_t);
 static OGS_POOL(mme_s11_teid_pool, ogs_pool_id_t);
+static OGS_POOL(mme_eir_cache_pool, mme_eir_cache_entry_t);
 static OGS_POOL(mme_gn_teid_pool, ogs_pool_id_t);
 static OGS_POOL(enb_ue_pool, enb_ue_t);
 static OGS_POOL(sgw_ue_pool, sgw_ue_t);
@@ -120,6 +121,9 @@ void mme_context_init(void)
     ogs_pool_random_id_generate(&mme_s11_teid_pool);
     ogs_pool_init(&mme_gn_teid_pool, ogs_global_conf()->max.ue);
     ogs_pool_random_id_generate(&mme_gn_teid_pool);
+     /* Twice the UE pool */
+    ogs_pool_init(&mme_eir_cache_pool, ogs_global_conf()->max.ue * 2);
+    
 
     ogs_pool_init(&enb_ue_pool, ogs_global_conf()->max.ue);
     ogs_pool_init(&sgw_ue_pool, ogs_global_conf()->max.ue);
@@ -144,8 +148,11 @@ void mme_context_init(void)
     ogs_assert(self.mme_s11_teid_hash);
     self.mme_gn_teid_hash = ogs_hash_make();
     ogs_assert(self.mme_gn_teid_hash);
+    self.eir.cache = ogs_hash_make();
+    ogs_assert(self.eir.cache);
 
     ogs_list_init(&self.mme_ue_list);
+    ogs_list_init(&self.eir.cache_list);
 
     context_initialized = 1;
 }
@@ -164,11 +171,14 @@ void mme_context_final(void)
     mme_sgsn_remove_all();
     mme_hssmap_remove_all();
     mme_emerg_remove_all();
+    mme_eir_cache_remove_all(); 
 
     ogs_assert(self.enb_addr_hash);
     ogs_hash_destroy(self.enb_addr_hash);
     ogs_assert(self.enb_id_hash);
     ogs_hash_destroy(self.enb_id_hash);
+    ogs_assert(self.eir.cache);
+    ogs_hash_destroy(self.eir.cache);
 
     ogs_assert(self.imsi_ue_hash);
     ogs_hash_destroy(self.imsi_ue_hash);
@@ -188,6 +198,7 @@ void mme_context_final(void)
     ogs_pool_final(&mme_gn_teid_pool);
     ogs_pool_final(&enb_ue_pool);
     ogs_pool_final(&sgw_ue_pool);
+    ogs_pool_final(&mme_eir_cache_pool);
 
     ogs_pool_final(&mme_enb_pool);
 
@@ -229,6 +240,12 @@ static int mme_context_prepare(void)
     self.dns.protocol = 0;      /* MME_DNS_PROTO_AUTO */
     self.dns.cache_ttl = 60;
     self.dns.guard_timeout = 3000;
+
+    self.eir.allow_whitelist = true;
+    self.eir.allow_greylist = true;
+    self.eir.allow_blacklist = false;
+    self.eir.max_age = 3600;
+    self.eir.on_unavailable = MME_EIR_ALLOW;
 
     return OGS_OK;
 }
@@ -336,6 +353,11 @@ static int mme_context_validation(void)
         ogs_nas_gprs_timer_from_sec(&gprs_timer, self.time.t3423.value) !=
         OGS_OK) {
         ogs_error("Not support GPRS Timer [%d]", (int)self.time.t3423.value);
+        return OGS_ERROR;
+    }
+
+    if (self.eir.enabled && self.eir.realm == NULL) {
+        ogs_error("No mme.eir.realm in '%s'", ogs_app()->file);
         return OGS_ERROR;
     }
 
@@ -2487,6 +2509,72 @@ int mme_context_parse_config(void)
                     }
                 } else if (!strcmp(mme_key, "mme_name")) {
                     self.mme_name = ogs_yaml_iter_value(&mme_iter);
+                } else if (!strcmp(mme_key, "eir")) {
+                    ogs_yaml_iter_t eir_iter;
+                    ogs_yaml_iter_recurse(&mme_iter, &eir_iter);
+
+                    while (ogs_yaml_iter_next(&eir_iter)) {
+                        const char *eir_key = ogs_yaml_iter_key(&eir_iter);
+                        ogs_assert(eir_key);
+                        if (!strcmp(eir_key, "enabled")) {
+                            self.eir.enabled =
+                                ogs_yaml_iter_bool(&eir_iter);                   
+                        } else if (!strcmp(eir_key, "host")) {
+                            self.eir.host = ogs_yaml_iter_value(&eir_iter);
+                        } else if (!strcmp(eir_key, "realm")) {
+                            self.eir.realm = ogs_yaml_iter_value(&eir_iter);
+                        } else if (!strcmp(eir_key, "max_age")) {
+                            const char *v = ogs_yaml_iter_value(&eir_iter);
+                            if (v) self.eir.max_age = atoi(v);
+                        } else if (!strcmp(eir_key, "on_unavailable")) {
+                            const char *v = ogs_yaml_iter_value(&eir_iter);
+                            if (v) {
+                                if (!strcmp(v, "allow")) self.eir.on_unavailable = MME_EIR_ALLOW;
+                                else if (!strcmp(v, "reject")) self.eir.on_unavailable = MME_EIR_REJECT;
+                                else ogs_warn("unknown eir.on_unavailable `%s` (allow|reject)", v);
+                            }
+                        } else if (!strcmp(eir_key, "allowed_states")) {
+                            ogs_yaml_iter_t allowed_states_iter;
+                            ogs_yaml_iter_recurse(&eir_iter,
+                                    &allowed_states_iter);
+                            ogs_assert(ogs_yaml_iter_type(
+                                        &allowed_states_iter) !=
+                                YAML_MAPPING_NODE);
+
+                            do {
+                                const char *v = NULL;
+
+                                if (ogs_yaml_iter_type(
+                                        &allowed_states_iter) ==
+                                        YAML_SEQUENCE_NODE) {
+                                    if (!ogs_yaml_iter_next(
+                                                &allowed_states_iter))
+                                        break;
+                                }
+
+                                v = ogs_yaml_iter_value(
+                                        &allowed_states_iter);
+                                if (v) {
+                                    if (!strcmp(v, "WHITELIST")) {
+                                        self.eir.allow_whitelist = true;
+                                    } else if (!strcmp(v, "GREYLIST")) {
+                                        self.eir.allow_greylist = true;
+                                    } else if (!strcmp(v, "BLACKLIST")) {
+                                        self.eir.allow_blacklist = true;
+                                    } else {
+                                        ogs_warn("'%s' is not a valid "
+                                            "eir allowed_states value. "
+                                            "Valid values include: "
+                                            "WHITELIST, GREYLIST, "
+                                            "BLACKLIST", v);
+                                    }
+                                }
+                            } while (ogs_yaml_iter_type(
+                                        &allowed_states_iter) ==
+                                    YAML_SEQUENCE_NODE);
+                        } else
+                            ogs_warn("unknown key `%s`", eir_key);
+                    }
                 } else if (!strcmp(mme_key, "time")) {
                     ogs_yaml_iter_t time_iter;
                     ogs_yaml_iter_recurse(&mme_iter, &time_iter);
@@ -3222,6 +3310,60 @@ mme_hssmap_t *mme_hssmap_find_by_imsi_bcd(const char *imsi_bcd)
     }
 
     return NULL;
+}
+
+mme_eir_cache_entry_t *mme_eir_cache_find(const char *imsi_bcd)
+{
+    ogs_assert(imsi_bcd);
+
+    return (mme_eir_cache_entry_t *)ogs_hash_get(
+            self.eir.cache, imsi_bcd, strlen(imsi_bcd));
+}
+
+int mme_eir_cache_update(const char *imsi_bcd, const char *imeisv_bcd,
+        uint32_t status)
+{
+    mme_eir_cache_entry_t *entry = NULL;
+
+    ogs_assert(imsi_bcd);
+    ogs_assert(imeisv_bcd);
+
+    entry = mme_eir_cache_find(imsi_bcd);
+    if (!entry) {
+        ogs_pool_alloc(&mme_eir_cache_pool, &entry);
+        if (!entry) {
+            ogs_error("[%s] EIR cache pool exhausted", imsi_bcd);
+            return OGS_ERROR;
+        }
+        memset(entry, 0, sizeof *entry);
+
+        ogs_cpystrn(entry->imsi_bcd, imsi_bcd, OGS_MAX_IMSI_BCD_LEN+1);
+
+        ogs_list_add(&self.eir.cache_list, entry);
+        /* The hash does not copy the key: point it at the entry's own
+         * buffer so it stays valid for the lifetime of the entry. */
+        ogs_hash_set(self.eir.cache,
+                entry->imsi_bcd, strlen(entry->imsi_bcd), entry);
+    }
+
+    ogs_cpystrn(entry->imeisv_bcd, imeisv_bcd, OGS_MAX_IMEISV_BCD_LEN+1);
+    entry->status = status;
+    entry->valid = true;
+    entry->checked_at = ogs_time_now();
+
+    return OGS_OK;
+}
+
+void mme_eir_cache_remove_all(void)
+{
+    mme_eir_cache_entry_t *entry = NULL, *next_entry = NULL;
+
+    ogs_list_for_each_safe(&self.eir.cache_list, next_entry, entry) {
+        ogs_list_remove(&self.eir.cache_list, entry);
+        ogs_hash_set(self.eir.cache,
+                entry->imsi_bcd, strlen(entry->imsi_bcd), NULL);
+        ogs_pool_free(&mme_eir_cache_pool, entry);
+    }
 }
 
 void mme_ue_set_hss_identity(mme_ue_t *mme_ue,
