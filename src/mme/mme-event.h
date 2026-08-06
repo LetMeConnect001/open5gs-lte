@@ -63,6 +63,7 @@ typedef long S1AP_ProcedureCode_t;
 typedef struct S1AP_S1AP_PDU ogs_s1ap_message_t;
 typedef struct ogs_nas_eps_message_s ogs_nas_eps_message_t;
 typedef struct ogs_diam_s6a_message_s ogs_diam_s6a_message_t;
+typedef struct ogs_diam_s13_message_s ogs_diam_s13_message_t;
 typedef struct mme_vlr_s mme_vlr_t;
 typedef struct mme_enb_s mme_enb_t;
 typedef struct enb_ue_s enb_ue_t;
@@ -94,6 +95,7 @@ typedef struct mme_event_s {
     ogs_nas_eps_message_t *nas_message;
 
     ogs_diam_s6a_message_t *s6a_message;
+    ogs_diam_s13_message_t *s13_message;
 
     mme_vlr_t *vlr;
     ogs_pool_id_t enb_id;
