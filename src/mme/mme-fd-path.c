@@ -27,6 +27,7 @@ static struct disp_hdl *hdl_s6a_clr = NULL;
 static struct disp_hdl *hdl_s6a_idr = NULL;
 
 static struct session_handler *mme_s6a_reg = NULL;
+static struct session_handler *mme_s13_reg = NULL;
 
 /* s6a process Subscription-Data from avp */
 static int mme_s6a_subscription_data_from_avp(struct avp *avp,
@@ -43,6 +44,7 @@ struct sess_state {
 static void mme_s6a_aia_cb(void *data, struct msg **msg);
 static void mme_s6a_ula_cb(void *data, struct msg **msg);
 static void mme_s6a_pua_cb(void *data, struct msg **msg);
+static void mme_s13_eca_cb(void *data, struct msg **msg);
 
 static void state_cleanup(struct sess_state *sess_data, os0_t sid, void *opaque)
 {
@@ -2679,6 +2681,160 @@ outnoexp:
 
     return 0;
 }
+
+/* MME Sends ME Identity Check Request to EIR */
+void mme_s13_send_ecr(enb_ue_t *enb_ue, mme_ue_t *mme_ue)
+{
+    int ret;
+
+    struct msg *req = NULL;
+    struct avp *avp, *avpch;
+    union avp_value val;
+    struct sess_state *sess_data = NULL, *svg;
+    struct session *session = NULL;
+
+    if (!mme_ue) {
+        ogs_error("UE(mme-ue) context has already been removed");
+        return;
+    }
+
+    if (!enb_ue) {
+        ogs_error("S1 context has already been removed");
+        return;
+    }
+
+    ogs_debug("[MME] ME-Identity-Check-Request");
+
+    if (!mme_ue->imeisv_len) {
+        ogs_error("[%s] No IMEISV available, skipping EIR check",
+                mme_ue->imsi_bcd);
+        mme_s6a_send_ulr(enb_ue, mme_ue, 0);
+        return;
+    }
+
+    if (!mme_self()->diam_eir_realm) {
+        ogs_warn("[%s] No EIR configured, skipping ME identity check",
+                mme_ue->imsi_bcd);
+        mme_s6a_send_ulr(enb_ue, mme_ue, create_action);
+        return;
+    }
+
+    /* Create the random value to store with the session */
+    sess_data = ogs_calloc(1, sizeof(*sess_data));
+    ogs_assert(sess_data);
+    sess_data->mme_ue_id = mme_ue->id;
+    sess_data->enb_ue_id = enb_ue->id;
+
+    /* Create the request */
+    ret = fd_msg_new(ogs_diam_s13_cmd_ecr, MSGFL_ALLOC_ETEID, &req);
+    ogs_assert(ret == 0);
+
+    /* Create a new session */
+    #define OGS_DIAM_S13_APP_SID_OPT  "app_s13"
+    ret = fd_msg_new_session(req, (os0_t)OGS_DIAM_S13_APP_SID_OPT,
+            CONSTSTRLEN(OGS_DIAM_S13_APP_SID_OPT));
+    ogs_assert(ret == 0);
+    ret = fd_msg_sess_get(fd_g_config->cnf_dict, req, &session, NULL);
+    ogs_assert(ret == 0);
+
+    /* Set Vendor-Specific-Application-Id AVP */
+    ret = ogs_diam_message_vendor_specific_appid_set(
+            req, OGS_DIAM_S13_APPLICATION_ID);
+    ogs_assert(ret == 0);
+
+    /* Set the Auth-Session-State AVP */
+    ret = fd_msg_avp_new(ogs_diam_auth_session_state, 0, &avp);
+    ogs_assert(ret == 0);
+    val.i32 = OGS_DIAM_AUTH_SESSION_NO_STATE_MAINTAINED;
+    ret = fd_msg_avp_setvalue(avp, &val);
+    ogs_assert(ret == 0);
+    ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
+    ogs_assert(ret == 0);
+
+    /* Set Origin-Host & Origin-Realm */
+    ret = fd_msg_add_origin(req, 0);
+    ogs_assert(ret == 0);
+
+     /* Set the Destination-Host AVP (optional per TS 29.272 §7.2.x) */
+    if (mme_self()->diam_eir_host) {
+        ret = fd_msg_avp_new(ogs_diam_destination_host, 0, &avp);
+        ogs_assert(ret == 0);
+        val.os.data = (uint8_t *)mme_self()->diam_eir_host;
+        val.os.len  = strlen(mme_self()->diam_eir_host);
+        ret = fd_msg_avp_setvalue(avp, &val);
+        ogs_assert(ret == 0);
+        ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
+        ogs_assert(ret == 0);
+    }
+
+    /* Set the Destination-Realm AVP (mandatory) */
+    ret = fd_msg_avp_new(ogs_diam_destination_realm, 0, &avp);
+    ogs_assert(ret == 0);
+    val.os.data = (uint8_t *)mme_self()->diam_eir_realm;
+    val.os.len  = strlen(mme_self()->diam_eir_realm);
+    ret = fd_msg_avp_setvalue(avp, &val);
+    ogs_assert(ret == 0);
+    ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
+    ogs_assert(ret == 0);
+
+    /* Set the Terminal-Information AVP */
+    ret = fd_msg_avp_new(ogs_diam_s13_terminal_information, 0, &avp);
+    ogs_assert(ret == 0);
+
+    ret = fd_msg_avp_new(ogs_diam_s13_imei, 0, &avpch);
+    ogs_assert(ret == 0);
+    val.os.data = (uint8_t *)mme_ue->imeisv_bcd;
+    val.os.len  = 14;
+    ret = fd_msg_avp_setvalue(avpch, &val);
+    ogs_assert(ret == 0);
+    ret = fd_msg_avp_add(avp, MSG_BRW_LAST_CHILD, avpch);
+    ogs_assert(ret == 0);
+
+    ret = fd_msg_avp_new(ogs_diam_s13_software_version, 0, &avpch);
+    ogs_assert(ret == 0);
+    val.os.data = (uint8_t *)mme_ue->imeisv_bcd + 14;
+    val.os.len  = 2;
+    ret = fd_msg_avp_setvalue(avpch, &val);
+    ogs_assert(ret == 0);
+    ret = fd_msg_avp_add(avp, MSG_BRW_LAST_CHILD, avpch);
+    ogs_assert(ret == 0);
+
+    ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
+    ogs_assert(ret == 0);
+
+    /* Set the User-Name AVP */
+    ret = fd_msg_avp_new(ogs_diam_user_name, 0, &avp);
+    ogs_assert(ret == 0);
+    val.os.data = (uint8_t *)mme_ue->imsi_bcd;
+    val.os.len = strlen(mme_ue->imsi_bcd);
+    ret = fd_msg_avp_setvalue(avp, &val);
+    ogs_assert(ret == 0);
+    ret = fd_msg_avp_add(req, MSG_BRW_LAST_CHILD, avp);
+    ogs_assert(ret == 0);
+
+    ret = clock_gettime(CLOCK_REALTIME, &sess_data->ts);
+    ogs_assert(ret == 0);
+
+    /* Keep a pointer to the session data for debug purpose,
+     * in real life we would not need it */
+    svg = sess_data;
+
+    /* Store this value in the session */
+    ret = fd_sess_state_store(mme_s13_reg, session, &sess_data);
+    ogs_assert(ret == 0);
+    ogs_assert(sess_data == 0);
+
+    /* Send the request */
+    ret = fd_msg_send(&req, mme_s13_eca_cb, svg);
+    ogs_assert(ret == 0);
+
+    /* Increment the counter */
+    ogs_assert(pthread_mutex_lock(&ogs_diam_stats_self()->stats_lock) == 0);
+    ogs_diam_stats_self()->stats.nb_sent++;
+    ogs_assert(pthread_mutex_unlock(&ogs_diam_stats_self()->stats_lock) == 0);
+}
+
+
 
 int mme_fd_init(void)
 {
